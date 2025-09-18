@@ -21,6 +21,7 @@ from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.tensorrt_utils import torch_to_onnx, build_engine, load_engine
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
 from indextts.s2mel.modules.bigvgan import bigvgan
@@ -38,7 +39,7 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False
+            use_cuda_kernel=None,use_deepspeed=False, use_tensorrt=False
     ):
         """
         Args:
@@ -48,6 +49,7 @@ class IndexTTS2:
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
             use_deepspeed (bool): whether to use DeepSpeed or not.
+            use_tensorrt (bool): whether to use TensorRT or not.
         """
         if device is not None:
             self.device = device
@@ -75,6 +77,10 @@ class IndexTTS2:
         self.model_dir = model_dir
         self.dtype = torch.float16 if self.use_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
+
+        self.use_tensorrt = use_tensorrt and torch.cuda.is_available()
+        if self.use_tensorrt:
+            print(">> TensorRT is enabled. Inference will be performed using TensorRT engines.")
 
         self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
 
@@ -154,6 +160,45 @@ class IndexTTS2:
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
         print(">> bigvgan weights restored from:", bigvgan_name)
+
+        if self.use_tensorrt:
+            # --- BigVGAN TensorRT ---
+            self.bigvgan_engine = None
+            onnx_path = os.path.join(self.model_dir, "bigvgan.onnx")
+            engine_path = os.path.join(self.model_dir, "bigvgan.trt")
+
+            if os.path.exists(engine_path):
+                self.bigvgan_engine = load_engine(engine_path)
+            else:
+                # Dummy input for BigVGAN
+                dummy_mel = torch.randn(1, 100, 200, device=self.device) # (B, C, T)
+
+                # Export to ONNX
+                torch_to_onnx(
+                    self.bigvgan,
+                    dummy_mel,
+                    onnx_path,
+                    input_names=["mel"],
+                    output_names=["wav"],
+                    dynamic_axes={"mel": {0: "batch", 2: "mel_len"}},
+                )
+
+                # Build engine
+                dynamic_shapes_bigvgan = [
+                    ("mel", (1, 100, 10), (1, 100, 500), (1, 100, 4000))
+                ]
+                self.bigvgan_engine = build_engine(
+                    onnx_path, engine_path, use_fp16=self.use_fp16, dynamic_shapes=dynamic_shapes_bigvgan
+                )
+
+            if self.bigvgan_engine:
+                print(">> BigVGAN TensorRT engine loaded.")
+                # Unload PyTorch model to save VRAM
+                del self.bigvgan
+                torch.cuda.empty_cache()
+            else:
+                print(">> Failed to load/build BigVGAN TensorRT engine. Falling back to PyTorch.")
+                # self.use_tensorrt = False # Disable TensorRT if a model fails
 
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
@@ -591,7 +636,37 @@ class IndexTTS2:
                     s2mel_time += time.perf_counter() - m_start_time
 
                     m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+                    if self.use_tensorrt and hasattr(self, 'bigvgan_engine') and self.bigvgan_engine:
+                        # Use TensorRT for BigVGAN
+                        vc_target_trt = vc_target.float()
+
+                        # Create execution context
+                        context = self.bigvgan_engine.create_execution_context()
+
+                        # Get input and output binding indices
+                        input_idx = self.bigvgan_engine.get_binding_index("mel")
+                        output_idx = self.bigvgan_engine.get_binding_index("wav")
+
+                        # Set input shape for the context
+                        context.set_input_shape("mel", vc_target_trt.shape)
+
+                        # Allocate memory for output
+                        output_shape = (vc_target_trt.shape[0], 1, vc_target_trt.shape[2] * 256)
+                        output_buffer = torch.empty(output_shape, dtype=torch.float32, device=self.device)
+
+                        # Create bindings
+                        bindings = [None, None]
+                        bindings[input_idx] = vc_target_trt.contiguous().data_ptr()
+                        bindings[output_idx] = output_buffer.contiguous().data_ptr()
+
+                        # Execute inference
+                        context.execute_v2(bindings=bindings)
+
+                        wav = output_buffer
+                    else:
+                        # Fallback to PyTorch
+                        wav = self.bigvgan(vc_target.float())
+
                     print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
