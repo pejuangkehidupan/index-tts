@@ -79,126 +79,13 @@ class IndexTTS2:
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
         self.use_tensorrt = use_tensorrt and torch.cuda.is_available()
+
         if self.use_tensorrt:
-            print(">> TensorRT is enabled. Inference will be performed using TensorRT engines.")
-
-        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
-
-        self.gpt = UnifiedVoice(**self.cfg.gpt)
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
-        load_checkpoint(self.gpt, self.gpt_path)
-        self.gpt = self.gpt.to(self.device)
-        if self.use_fp16:
-            self.gpt.eval().half()
+            print(">> TensorRT is enabled. Loading and converting models sequentially...")
+            self._init_tensorrt_models()
         else:
-            self.gpt.eval()
-        print(">> GPT weights restored from:", self.gpt_path)
-
-        if use_deepspeed:
-            try:
-                import deepspeed
-            except (ImportError, OSError, CalledProcessError) as e:
-                use_deepspeed = False
-                print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
-
-        self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=self.use_fp16)
-
-        if self.use_cuda_kernel:
-            # preload the CUDA kernel for BigVGAN
-            try:
-                from indextts.s2mel.modules.bigvgan.alias_free_activation.cuda import activation1d
-
-                print(">> Preload custom CUDA kernel for BigVGAN", activation1d.anti_alias_activation_cuda)
-            except Exception as e:
-                print(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
-                print(f"{e!r}")
-                self.use_cuda_kernel = False
-
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
-        self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
-            os.path.join(self.model_dir, self.cfg.w2v_stat))
-        self.semantic_model = self.semantic_model.to(self.device)
-        self.semantic_model.eval()
-        self.semantic_mean = self.semantic_mean.to(self.device)
-        self.semantic_std = self.semantic_std.to(self.device)
-
-        semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
-        semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
-        safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
-        self.semantic_codec = semantic_codec.to(self.device)
-        self.semantic_codec.eval()
-        print('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
-
-        s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
-        s2mel = MyModel(self.cfg.s2mel, use_gpt_latent=True)
-        s2mel, _, _, _ = load_checkpoint2(
-            s2mel,
-            None,
-            s2mel_path,
-            load_only_params=True,
-            ignore_modules=[],
-            is_distributed=False,
-        )
-        self.s2mel = s2mel.to(self.device)
-        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
-        self.s2mel.eval()
-        print(">> s2mel weights restored from:", s2mel_path)
-
-        # load campplus_model
-        campplus_ckpt_path = hf_hub_download(
-            "funasr/campplus", filename="campplus_cn_common.bin"
-        )
-        campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
-        campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
-        self.campplus_model = campplus_model.to(self.device)
-        self.campplus_model.eval()
-        print(">> campplus_model weights restored from:", campplus_ckpt_path)
-
-        bigvgan_name = self.cfg.vocoder.name
-        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
-        self.bigvgan = self.bigvgan.to(self.device)
-        self.bigvgan.remove_weight_norm()
-        self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", bigvgan_name)
-
-        if self.use_tensorrt:
-            # --- BigVGAN TensorRT ---
-            self.bigvgan_engine = None
-            onnx_path = os.path.join(self.model_dir, "bigvgan.onnx")
-            engine_path = os.path.join(self.model_dir, "bigvgan.trt")
-
-            if os.path.exists(engine_path):
-                self.bigvgan_engine = load_engine(engine_path)
-            else:
-                # Dummy input for BigVGAN
-                dummy_mel = torch.randn(1, 100, 200, device=self.device) # (B, C, T)
-
-                # Export to ONNX
-                torch_to_onnx(
-                    self.bigvgan,
-                    dummy_mel,
-                    onnx_path,
-                    input_names=["mel"],
-                    output_names=["wav"],
-                    dynamic_axes={"mel": {0: "batch", 2: "mel_len"}},
-                )
-
-                # Build engine
-                dynamic_shapes_bigvgan = [
-                    ("mel", (1, 100, 10), (1, 100, 500), (1, 100, 4000))
-                ]
-                self.bigvgan_engine = build_engine(
-                    onnx_path, engine_path, use_fp16=self.use_fp16, dynamic_shapes=dynamic_shapes_bigvgan
-                )
-
-            if self.bigvgan_engine:
-                print(">> BigVGAN TensorRT engine loaded.")
-                # Unload PyTorch model to save VRAM
-                del self.bigvgan
-                torch.cuda.empty_cache()
-            else:
-                print(">> Failed to load/build BigVGAN TensorRT engine. Falling back to PyTorch.")
-                # self.use_tensorrt = False # Disable TensorRT if a model fails
+            print(">> Standard PyTorch mode. Loading all models...")
+            self._init_pytorch_models(use_deepspeed)
 
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
@@ -530,6 +417,9 @@ class IndexTTS2:
             m_start_time = time.perf_counter()
             with torch.no_grad():
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    if self.use_tensorrt:
+                        self.gpt.to(self.device)
+
                     emovec = self.gpt.merge_emovec(
                         spk_cond_emb,
                         emo_cond_emb,
@@ -560,6 +450,10 @@ class IndexTTS2:
                         max_generate_length=max_mel_tokens,
                         **generation_kwargs
                     )
+
+                    if self.use_tensorrt:
+                        self.gpt.to('cpu')
+                        torch.cuda.empty_cache()
 
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
@@ -597,6 +491,9 @@ class IndexTTS2:
                 m_start_time = time.perf_counter()
                 use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    if self.use_tensorrt:
+                        self.gpt.to(self.device)
+
                     latent = self.gpt(
                         speech_conditioning_latent,
                         text_tokens,
@@ -609,6 +506,11 @@ class IndexTTS2:
                         emo_vec=emovec,
                         use_speed=use_speed,
                     )
+
+                    if self.use_tensorrt:
+                        self.gpt.to('cpu')
+                        torch.cuda.empty_cache()
+
                     gpt_forward_time += time.perf_counter() - m_start_time
 
                 dtype = None
@@ -636,7 +538,7 @@ class IndexTTS2:
                     s2mel_time += time.perf_counter() - m_start_time
 
                     m_start_time = time.perf_counter()
-                    if self.use_tensorrt and hasattr(self, 'bigvgan_engine') and self.bigvgan_engine:
+                    if self.use_tensorrt and self.bigvgan_engine:
                         # Use TensorRT for BigVGAN
                         vc_target_trt = vc_target.float()
 
@@ -829,6 +731,184 @@ class QwenEmotion:
             # print(">>  after vec swap", content)
 
         return self.convert(content)
+
+
+    def _init_pytorch_models(self, use_deepspeed=False):
+        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+
+        self.gpt = UnifiedVoice(**self.cfg.gpt)
+        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        load_checkpoint(self.gpt, self.gpt_path)
+        self.gpt = self.gpt.to(self.device)
+        if self.use_fp16:
+            self.gpt.eval().half()
+        else:
+            self.gpt.eval()
+        print(">> GPT weights restored from:", self.gpt_path)
+
+        if use_deepspeed:
+            try:
+                import deepspeed
+            except (ImportError, OSError, CalledProcessError) as e:
+                use_deepspeed = False
+                print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
+
+        self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=self.use_fp16)
+
+        if self.use_cuda_kernel:
+            # preload the CUDA kernel for BigVGAN
+            try:
+                from indextts.s2mel.modules.bigvgan.alias_free_activation.cuda import activation1d
+
+                print(">> Preload custom CUDA kernel for BigVGAN", activation1d.anti_alias_activation_cuda)
+            except Exception as e:
+                print(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
+                print(f"{e!r}")
+                self.use_cuda_kernel = False
+
+        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+        self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
+            os.path.join(self.model_dir, self.cfg.w2v_stat))
+        self.semantic_model = self.semantic_model.to(self.device)
+        self.semantic_model.eval()
+        self.semantic_mean = self.semantic_mean.to(self.device)
+        self.semantic_std = self.semantic_std.to(self.device)
+
+        semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
+        semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
+        self.semantic_codec = semantic_codec.to(self.device)
+        self.semantic_codec.eval()
+        print('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
+
+        s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
+        s2mel = MyModel(self.cfg.s2mel, use_gpt_latent=True)
+        s2mel, _, _, _ = load_checkpoint2(
+            s2mel,
+            None,
+            s2mel_path,
+            load_only_params=True,
+            ignore_modules=[],
+            is_distributed=False,
+        )
+        self.s2mel = s2mel.to(self.device)
+        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        self.s2mel.eval()
+        print(">> s2mel weights restored from:", s2mel_path)
+
+        # load campplus_model
+        campplus_ckpt_path = hf_hub_download(
+            "funasr/campplus", filename="campplus_cn_common.bin"
+        )
+        campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
+        campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
+        self.campplus_model = campplus_model.to(self.device)
+        self.campplus_model.eval()
+        print(">> campplus_model weights restored from:", campplus_ckpt_path)
+
+        bigvgan_name = self.cfg.vocoder.name
+        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
+        self.bigvgan = self.bigvgan.to(self.device)
+        self.bigvgan.remove_weight_norm()
+        self.bigvgan.eval()
+        print(">> bigvgan weights restored from:", bigvgan_name)
+
+    def _init_tensorrt_models(self):
+        # This method loads models sequentially to save VRAM during TRT conversion.
+
+        # Load non-TRT models first
+        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+
+        self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
+            os.path.join(self.model_dir, self.cfg.w2v_stat))
+        self.semantic_model = self.semantic_model.to(self.device)
+        self.semantic_model.eval()
+        self.semantic_mean = self.semantic_mean.to(self.device)
+        self.semantic_std = self.semantic_std.to(self.device)
+
+        semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
+        semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
+        self.semantic_codec = semantic_codec.to(self.device)
+        self.semantic_codec.eval()
+        print('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
+
+        s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
+        s2mel = MyModel(self.cfg.s2mel, use_gpt_latent=True)
+        s2mel, _, _, _ = load_checkpoint2(
+            s2mel,
+            None,
+            s2mel_path,
+            load_only_params=True,
+            ignore_modules=[],
+            is_distributed=False,
+        )
+        self.s2mel = s2mel.to(self.device)
+        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        self.s2mel.eval()
+        print(">> s2mel weights restored from:", s2mel_path)
+
+        campplus_ckpt_path = hf_hub_download(
+            "funasr/campplus", filename="campplus_cn_common.bin"
+        )
+        campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
+        campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
+        self.campplus_model = campplus_model.to(self.device)
+        self.campplus_model.eval()
+        print(">> campplus_model weights restored from:", campplus_ckpt_path)
+
+        # --- BigVGAN TensorRT Conversion ---
+        print(">> Initializing BigVGAN for TensorRT...")
+        bigvgan_name = self.cfg.vocoder.name
+        bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
+        bigvgan_model = bigvgan_model.to(self.device)
+        bigvgan_model.remove_weight_norm()
+        bigvgan_model.eval()
+
+        self.bigvgan_engine = None
+        onnx_path = os.path.join(self.model_dir, "bigvgan.onnx")
+        engine_path = os.path.join(self.model_dir, "bigvgan.trt")
+
+        if os.path.exists(engine_path):
+            self.bigvgan_engine = load_engine(engine_path)
+        else:
+            dummy_mel = torch.randn(1, 100, 200, device=self.device)
+            dynamic_shapes_bigvgan = [
+                ("mel", (1, 100, 10), (1, 100, 500), (1, 100, 4000))
+            ]
+            torch_to_onnx(
+                bigvgan_model,
+                dummy_mel,
+                onnx_path,
+                input_names=["mel"],
+                output_names=["wav"],
+                dynamic_axes={"mel": {0: "batch", 2: "mel_len"}},
+            )
+            self.bigvgan_engine = build_engine(
+                onnx_path, engine_path, use_fp16=self.use_fp16, dynamic_shapes=dynamic_shapes_bigvgan
+            )
+
+        if self.bigvgan_engine:
+            print(">> BigVGAN TensorRT engine loaded successfully.")
+            self.bigvgan = None # Set to None, will be used in infer method
+            del bigvgan_model
+            torch.cuda.empty_cache()
+        else:
+            print(">> WARNING: Failed to build/load BigVGAN TensorRT engine. Falling back to PyTorch for this model.")
+            self.bigvgan = bigvgan_model
+
+        # --- GPT Model ---
+        # Instead of a full TensorRT conversion, we will load the model to CPU first
+        # and only move it to GPU when needed. This solves the startup OOM issue.
+        print(">> Initializing GPT model on CPU to save VRAM...")
+        self.gpt = UnifiedVoice(**self.cfg.gpt)
+        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        load_checkpoint(self.gpt, self.gpt_path)
+        self.gpt.to('cpu') # Move to CPU immediately after loading
+        self.gpt.eval()
+        print(">> GPT weights loaded to CPU.")
+        self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=True, half=self.use_fp16)
 
 
 if __name__ == "__main__":
