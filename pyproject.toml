@@ -71,6 +71,10 @@ webui = [
 deepspeed = [
   "deepspeed==0.17.1",
 ]
+# To install the TensorRT support, use `uv sync --extra tensorrt` (or `--all-extras`).
+tensorrt = [
+    "tensorrt-cu12"
+]
 
 [project.urls]
 Homepage = "https://github.com/index-tts/index-tts"
